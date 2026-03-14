@@ -1,59 +1,47 @@
 import cv2
 import numpy as np
 import time
-import threading
 from simple_pid import PID
-
-# Crazyflie libraries (Standard for ESP-Drone)
-import cflib.crtp
-from cflib.crazyflie import Crazyflie
-from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
+import drone_rc  # Your updated library with LED support
 
 # ==========================================
-# CONFIGURATION - ADJUST THESE TOMORROW
+# CONFIGURATION
 # ==========================================
-# Camera indices (MacBook usually: 0=FaceTime, 1=USB1, 2=USB2)
 CAM_FRONT_INDEX = 1 
 CAM_SIDE_INDEX = 2
 
-# The Drone's Wi-Fi IP (Default for ESP-Drone)
-URI = 'udp://192.168.4.1'
-
-# Target Hover Point (0.5m in a 1.0m cage)
 TARGET_X = 0.5 
 TARGET_Y = 0.5
 TARGET_Z = 0.5 
 
-# Color Tracking (HSV) - Adjust based on LED color
-# Tip: Use a tool to find the HSV of the LED in your room
-LOWER_LED = np.array([0, 0, 250])  # Very bright white/color
-UPPER_LED = np.array([180, 30, 255])
+# --- GREEN LED TRACKING (HSV) ---
+# These values are tuned for a glowing Green LED.
+# If it's too dark, lower the third number (50).
+LOWER_GREEN = np.array([40, 50, 50])  
+UPPER_GREEN = np.array([90, 255, 255])
 
-class DroneController:
+class CompetitionController:
     def __init__(self):
         self.is_running = True
-        self.drone = None
         
-        # --- PID CONTROLLERS ---
-        # Kp: React speed | Ki: Wind resistance | Kd: Stability
-        self.pid_x = PID(15.0, 2.0, 1.0, setpoint=TARGET_X)  # Controls ROLL
-        self.pid_y = PID(15.0, 2.0, 1.0, setpoint=TARGET_Y)  # Controls PITCH
-        self.pid_z = PID(10000, 2000, 5000, setpoint=TARGET_Z) # Controls THRUST
+        # PID Tunings
+        # Scale for Mode 2 is small. Start here.
+        self.pid_x = PID(15.0, 3.0, 1.5, setpoint=TARGET_X)   # Roll
+        self.pid_y = PID(15.0, 3.0, 1.5, setpoint=TARGET_Y)   # Pitch
+        self.pid_z = PID(40.0, 8.0, 10.0, setpoint=TARGET_Z)  # Thrust
 
-        # Limits to prevent the drone from flipping
-        self.pid_x.output_limits = (-15, 15) # Max 15 degree tilt
+        self.pid_x.output_limits = (-15, 15) 
         self.pid_y.output_limits = (-15, 15)
-        self.pid_z.output_limits = (-15000, 15000) # Adjustment range for thrust
+        self.pid_z.output_limits = (-50, 50) 
 
-        self.base_thrust = 38000 # The power needed to just barely float
+        self.base_thrust = 140 # ADJUST THIS: The power to hover (0-250)
 
     def get_led_pos(self, frame):
-        """Finds the LED and returns normalized (0.0 to 1.0) coordinates"""
         if frame is None: return None, None
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, LOWER_LED, UPPER_LED)
+        mask = cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN)
         
-        # Clean up noise
+        # Noise reduction
         mask = cv2.erode(mask, None, iterations=2)
         mask = cv2.dilate(mask, None, iterations=2)
         
@@ -62,90 +50,76 @@ class DroneController:
             c = max(contours, key=cv2.contourArea)
             M = cv2.moments(c)
             if M["m00"] > 0:
-                # X-pixel / Total-Width
                 return M["m10"]/M["m00"] / frame.shape[1], M["m01"]/M["m00"] / frame.shape[0]
         return None, None
 
-    def emergency_stop(self):
-        """The mandatory kill-switch"""
-        print("\n!!! EMERGENCY STOP !!!")
-        self.is_running = False
-        if self.drone:
-            # Cut motors immediately
-            self.drone.cf.commander.send_setpoint(0, 0, 0, 0)
-            time.sleep(0.1)
-
-# ==========================================
-# MAIN EXECUTION
-# ==========================================
 def main():
-    ctrl = DroneController()
+    ctrl = CompetitionController()
     
-    # 1. Initialize Communication
-    cflib.crtp.init_drivers()
-    
-    # 2. Open Cameras
+    # 1. Initialize Drone and LEDs
+    print("Connecting and turning on Green LED...")
+    drone_rc.set_mode(2)
+    drone_rc.green_LED(1) # Turn on Green LED for tracking
+    drone_rc.red_LED(0)
+    drone_rc.blue_LED(0)
+    time.sleep(1)
+
     cap_f = cv2.VideoCapture(CAM_FRONT_INDEX)
     cap_s = cv2.VideoCapture(CAM_SIDE_INDEX)
 
-    print(f"Connecting to Drone at {URI}...")
-    
+    print("System Live. Press SPACE for Emergency Stop.")
+
     try:
-        with SyncCrazyflie(URI, cf=Crazyflie(rw_cache='./cache')) as scf:
-            ctrl.drone = scf
-            print("Connected! Press SPACE in the video window to Emergency Stop.")
+        while ctrl.is_running:
+            ret_f, frame_f = cap_f.read()
+            ret_s, frame_s = cap_s.read()
+
+            # --- SENSE ---
+            curr_x, curr_z1 = ctrl.get_led_pos(frame_f)
+            curr_y, curr_z2 = ctrl.get_led_pos(frame_s)
+
+            # --- THINK & ACT ---
+            if curr_x is not None and curr_y is not None:
+                avg_z = (curr_z1 + curr_z2) / 2
+                
+                # PID Calculations
+                roll = ctrl.pid_x(curr_x)
+                pitch = ctrl.pid_y(curr_y)
+                thrust_adj = ctrl.pid_z(1.0 - avg_z) # Inverted for screen coords
+                
+                final_thrust = int(ctrl.base_thrust + thrust_adj)
+                final_thrust = max(0, min(250, final_thrust))
+
+                # Send commands
+                drone_rc.set_roll(roll)
+                drone_rc.set_pitch(pitch)
+                drone_rc.manual_thrusts(final_thrust, final_thrust, final_thrust, final_thrust)
+                
+                # Visual Debug
+                cv2.circle(frame_f, (int(curr_x*frame_f.shape[1]), int(curr_z1*frame_f.shape[0])), 15, (0, 255, 0), 2)
+                print(f"X:{curr_x:.2f} Y:{curr_y:.2f} Z:{avg_z:.2f} | T:{final_thrust}", end='\r')
+            else:
+                # Level out if LED lost
+                drone_rc.set_roll(0)
+                drone_rc.set_pitch(0)
+                drone_rc.manual_thrusts(ctrl.base_thrust, ctrl.base_thrust, ctrl.base_thrust, ctrl.base_thrust)
+                print("!!! LED LOST !!!                     ", end='\r')
+
+            # --- UI ---
+            if frame_f is not None: cv2.imshow('Front (X/Z)', frame_f)
+            if frame_s is not None: cv2.imshow('Side (Y/Z)', frame_s)
             
-            while ctrl.is_running:
-                ret_f, frame_f = cap_f.read()
-                ret_s, frame_s = cap_s.read()
+            # The 20ms delay protects the Wi-Fi bandwidth
+            key = cv2.waitKey(20) & 0xFF 
+            if key == ord(' '): 
+                print("\nEmergency Stop Triggered.")
+                drone_rc.emergency_stop()
+                drone_rc.green_LED(0)
+                ctrl.is_running = False
 
-                # --- 1. VISION STEP ---
-                curr_x, curr_z1 = ctrl.get_led_pos(frame_f)
-                curr_y, curr_z2 = ctrl.get_led_pos(frame_s)
-                
-                # Draw on Front Camera
-                if curr_x is not None:
-                    px_f = int(curr_x * frame_f.shape[1])
-                    py_f = int(curr_z1 * frame_f.shape[0])
-                    cv2.circle(frame_f, (px_f, py_f), 10, (0, 255, 0), 2)
-                    cv2.putText(frame_f, "TRACKING X/Z", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-                # Draw on Side Camera
-                if curr_y is not None:
-                    px_s = int(curr_y * frame_s.shape[1])
-                    py_s = int(curr_z2 * frame_s.shape[0])
-                    cv2.circle(frame_s, (px_s, py_s), 10, (0, 255, 0), 2)
-                    cv2.putText(frame_s, "TRACKING Y/Z", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-                # --- 2. BRAIN STEP (With Safety Check) ---
-                if curr_x is not None and curr_y is not None:
-                    # WE SEE THE DRONE: Run PID normally
-                    avg_z = (curr_z1 + curr_z2) / 2
-                    
-                    roll = ctrl.pid_x(curr_x)
-                    pitch = ctrl.pid_y(curr_y)
-                    thrust_adj = ctrl.pid_z(1.0 - avg_z)
-                    
-                    final_thrust = int(ctrl.base_thrust + thrust_adj)
-                    final_thrust = max(0, min(65535, final_thrust)) 
-
-                    scf.cf.commander.send_setpoint(roll, pitch, 0, final_thrust)
-                    print(f"Pos: {curr_x:.2f}, {curr_y:.2f}, {avg_z:.2f} | T:{final_thrust}", end='\r')
-                else:
-                    # SAFETY: Level the drone and hold base thrust if lost
-                    scf.cf.commander.send_setpoint(0, 0, 0, ctrl.base_thrust)
-                    print("!!! LOST LED: LEVELING OUT !!!          ", end='\r')
-
-                # --- 3. UI STEP ---
-                if frame_f is not None: cv2.imshow('Front Camera (X/Z)', frame_f)
-                if frame_s is not None: cv2.imshow('Side Camera (Y/Z)', frame_s)
-                
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord(' '): 
-                    ctrl.emergency_stop()
-                    
     except Exception as e:
-        print(f"\nConnection Error: {e}")
+        print(f"\nError: {e}")
+        drone_rc.emergency_stop()
     finally:
         cap_f.release()
         cap_s.release()
@@ -153,45 +127,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-# How to use this for the Competition:
-
-# Calibration (Finding the LED):
-# The LOWER_LED and UPPER_LED are currenty set to look for a very bright white light. 
-# Tomorrow, when you see the drone, you need to find its color.
-
-# Pro Tip: Use your phone's camera, point it at the drone LED, and see what color it appears as on the screen.
-
-# Finding "Base Thrust":
-# Before the competition, run a small test script that just sends send_setpoint(0, 0, 0, T). 
-# Slowly increase T (e.g., 30000, 32000, 34000) until the drone is neutral (neither falling nor rising). 
-# Put that number in self.base_thrust.
-
-# The "Inversion" Problem:
-# In OpenCV, the pixel 
-# (0,0) is the Top Left.
-
-# If your drone moves UP, the pixel value y actually gets smaller.
-
-# This is why I wrote ctrl.pid_z(1.0 - avg_z). If the drone moves the wrong way tomorrow, 
-# just remove the 1.0 - part.
-
-# Tuning the PID (The Winning Factor):
-
-# If the drone is sluggish and doesn't fight the wind: Increase Kp for X and Y.
-
-# If the drone oscillates (shakes back and forth): Decrease Kp or increase Kd.
-
-# The Bonus (Wind Test): If the fan pushes the drone and it stays 10cm away from the center, 
-# increase Ki. This will make the drone "realize" it's off-center and tilt harder into the wind.
-
-# Handling the "Custom Library" Tomorrow:
-# If they provide a custom library at 10 AM, look at the main() function. 
-# Instead of with SyncCrazyflie(...), you will use whatever connection method they provide. 
-# The logic inside the while loop (Vision -> PID -> Commands) will remain exactly the same.
-
-# Why this script will impress the judges:
-# It handles two cameras simultaneously.
-
-# It has a built-in Thread-safe Emergency Stop.
-
-# It uses PID normalization (mapping pixels to a 0.0-1.0 range), which is how professional industrial robots are programmed.
