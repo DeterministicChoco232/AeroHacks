@@ -37,7 +37,7 @@ class DroneController:
         self.pid_z.output_limits = (-50, 50) 
 
         # STARTING THRUST: Adjust this until drone stays at 0.5m
-        self.base_thrust = 3000 
+        self.base_thrust = 0 ##100 
 
     def get_drone_center(self, frame):
         """Finds all bright LEDs and returns their averaged center"""
@@ -102,7 +102,7 @@ def main():
                 avg_z = 1.0 - ((z_f + z_s) / 2)
                 
                 # PID Calculations
-                roll = ctrl.pid_x(x)
+                roll = ctrl.pid_x(x) 
                 pitch = ctrl.pid_y(y)
                 thrust_adj = ctrl.pid_z(avg_z)
                 

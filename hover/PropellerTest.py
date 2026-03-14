@@ -1,37 +1,19 @@
 import drone_rc
 import time
 
-def force_spin():
-    print("--- MOTOR RECOVERY TEST ---")
-    
-    # 1. Start in Mode 0, then Mode 1
-    drone_rc.set_mode(0)
-    time.sleep(0.5)
-    drone_rc.set_mode(1)
-    time.sleep(0.5)
-    
-    # 2. Try Syntax A: The library's way (with a newline)
-    print("Trying Syntax A (Library Default)...")
-    drone_rc.manual_thrusts(180, 180, 180, 180)
-    time.sleep(1)
+drone_rc.set_mode(2)
+thrust = 0  # Start here
 
-    # 3. Try Syntax B: Space instead of Newline (Very common for ESP32)
-    print("Trying Syntax B (Space Format)...")
-    drone_rc.msg("manT 180,180,180,180")
-    time.sleep(1)
+print("Finding Lift-Off Point. BE READY TO KILL POWER (Ctrl+C or Space)")
 
-    # 4. Try Syntax C: No Newline, No Space
-    print("Trying Syntax C (Direct Format)...")
-    drone_rc.msg("manT180,180,180,180")
-    time.sleep(1)
-
-    # 5. Try Syntax D: Increment Command
-    print("Trying Syntax D (Increment)...")
-    drone_rc.msg("incT 100,100,100,100")
-    time.sleep(1)
-
-    print("Test finished. Stopping...")
+try:
+    while thrust <= 200:
+        print(f"Current Thrust: {thrust}")
+        # Send same thrust to all 4 motors
+        drone_rc.manual_thrusts(thrust, thrust, thrust, thrust)
+        
+        time.sleep(1.0) # Stay at this level for 1 second
+        thrust += 5     # Increase by 5
+        
+except KeyboardInterrupt:
     drone_rc.emergency_stop()
-
-if __name__ == "__main__":
-    force_spin()
