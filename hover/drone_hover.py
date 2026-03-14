@@ -99,47 +99,51 @@ def main():
                 ret_f, frame_f = cap_f.read()
                 ret_s, frame_s = cap_s.read()
 
-                # --- VISION STEP ---
-                # Camera 1 (Front) gives us X and Height(Z)
+                # --- 1. VISION STEP ---
                 curr_x, curr_z1 = ctrl.get_led_pos(frame_f)
-                # Camera 2 (Side) gives us Y and Height(Z)
                 curr_y, curr_z2 = ctrl.get_led_pos(frame_s)
                 
-                # Draw a circle on the LED so judges can see it's working
+                # Draw on Front Camera
                 if curr_x is not None:
-                    # Convert normalized (0.5) back to pixels (320)
-                    px = int(curr_x * frame_f.shape[1])
-                    py = int(curr_z1 * frame_f.shape[0])
-                    cv2.circle(frame_f, (px, py), 10, (0, 255, 0), 2)
+                    px_f = int(curr_x * frame_f.shape[1])
+                    py_f = int(curr_z1 * frame_f.shape[0])
+                    cv2.circle(frame_f, (px_f, py_f), 10, (0, 255, 0), 2)
+                    cv2.putText(frame_f, "TRACKING X/Z", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
+                # Draw on Side Camera
+                if curr_y is not None:
+                    px_s = int(curr_y * frame_s.shape[1])
+                    py_s = int(curr_z2 * frame_s.shape[0])
+                    cv2.circle(frame_s, (px_s, py_s), 10, (0, 255, 0), 2)
+                    cv2.putText(frame_s, "TRACKING Y/Z", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+                # --- 2. BRAIN STEP (With Safety Check) ---
                 if curr_x is not None and curr_y is not None:
-                    # Average the height from both cameras for accuracy
+                    # WE SEE THE DRONE: Run PID normally
                     avg_z = (curr_z1 + curr_z2) / 2
                     
-                    # --- BRAIN STEP (PID) ---
-                    # Note: We invert Z because pixels (0) is top, but we want 1.0 to be top
                     roll = ctrl.pid_x(curr_x)
                     pitch = ctrl.pid_y(curr_y)
                     thrust_adj = ctrl.pid_z(1.0 - avg_z)
                     
                     final_thrust = int(ctrl.base_thrust + thrust_adj)
-                    final_thrust = max(0, min(65535, final_thrust)) # Safety Clamp
+                    final_thrust = max(0, min(65535, final_thrust)) 
 
-                    # --- ACT STEP (Command) ---
-                    # Format: Roll, Pitch, Yaw, Thrust
                     scf.cf.commander.send_setpoint(roll, pitch, 0, final_thrust)
-                    
-                    # Debug Info
-                    print(f"Pos: {curr_x:.2f}, {curr_y:.2f}, {avg_z:.2f} | Out: R:{roll:.1f} P:{pitch:.1f} T:{final_thrust}", end='\r')
+                    print(f"Pos: {curr_x:.2f}, {curr_y:.2f}, {avg_z:.2f} | T:{final_thrust}", end='\r')
+                else:
+                    # SAFETY: Level the drone and hold base thrust if lost
+                    scf.cf.commander.send_setpoint(0, 0, 0, ctrl.base_thrust)
+                    print("!!! LOST LED: LEVELING OUT !!!          ", end='\r')
 
-                # Show the camera feed
-                if frame_f is not None: cv2.imshow('Front Camera', frame_f)
+                # --- 3. UI STEP ---
+                if frame_f is not None: cv2.imshow('Front Camera (X/Z)', frame_f)
+                if frame_s is not None: cv2.imshow('Side Camera (Y/Z)', frame_s)
                 
-                # Check for Spacebar (Emergency Stop)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord(' '): 
                     ctrl.emergency_stop()
-
+                    
     except Exception as e:
         print(f"\nConnection Error: {e}")
     finally:
