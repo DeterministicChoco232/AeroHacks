@@ -2,82 +2,92 @@ import cv2
 import numpy as np
 import drone_rc
 
-# ======================================================
-# MANUAL CONFIGURATION AREA
-# Update these numbers, save the file, and watch the mask
-# Format: (H_min, S_min, V_min, H_max, S_max, V_max)
-# ======================================================
-CONFIGS = {
-    "1": {"name": "RED",   "hsv": (0, 100, 100, 10, 255, 255)},
-    "2": {"name": "GREEN", "hsv": (35, 50, 50, 90, 255, 255)},
-    "3": {"name": "BLUE",  "hsv": (100, 150, 50, 140, 255, 255)},
-    "4": {"name": "WHITE", "hsv": (0, 0, 240, 180, 30, 255)}
-}
-
-def set_drone_led(choice):
-    """Turns on only the LED we are currently calibrating"""
-    drone_rc.red_LED(1 if choice == "1" else 0)
-    drone_rc.green_LED(1 if choice == "2" else 0)
-    drone_rc.blue_LED(1 if choice == "3" else 0)
-    # Note: If 4 is a status white LED, it might always be on
-
 def main():
-    # Start in 'Safe' mode (Propellers OFF)
+    # 1. Initialize Drone (Motors OFF, LEDs ON)
     try:
         drone_rc.set_mode(0)
+        drone_rc.green_LED(1)
+        drone_rc.red_LED(1)
+        drone_rc.blue_LED(1)
+        print("Drone Connected: LEDs ON, Motors SAFE.")
     except:
-        print("Drone not connected - checking camera only.")
+        print("Drone not connected. Running in Camera-Only mode.")
 
-    cap = cv2.VideoCapture(1) # Start with Camera 1
-    current_choice = "1"
-    set_drone_led(current_choice)
+    # 2. Setup Variables [Hmin, Smin, Vmin, Hmax, Smax, Vmax]
+    # Starting with a wide range
+    hsv_vals = [42, 0, 250, 135, 255, 255] 
+    cam_idx = 0
+    cap = cv2.VideoCapture(cam_idx)
 
-    print(f"--- CALIBRATION MODE ---")
-    print(f"Press '1' for RED, '2' for GREEN, '3' for BLUE, '4' for WHITE")
-    print(f"Press 'c' to swap between Camera 1 and Camera 2")
-    print(f"Press 'q' to quit")
+    print("\n--- KEYBOARD CALIBRATION ---")
+    print("MIN: H:[Q/A]  S:[W/S]  V:[E/D]")
+    print("MAX: H:[R/F]  S:[T/G]  V:[Y/H]")
+    print("CAM: [C]  PRINT: [P]  QUIT: [ESC]")
 
     while True:
         ret, frame = cap.read()
-        if not ret: break
+        if not ret:
+            print("Camera failed. Trying to reconnect...")
+            cap.release()
+            cap = cv2.VideoCapture(cam_idx)
+            continue
 
-        # Get current color setup
-        cfg = CONFIGS[current_choice]
-        lower = np.array(cfg["hsv"][0:3])
-        upper = np.array(cfg["hsv"][3:6])
-
-        # Create Black & White Mask
+        # Process HSV
         hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        lower = np.array(hsv_vals[0:3])
+        upper = np.array(hsv_vals[3:6])
         mask = cv2.inRange(hsv_frame, lower, upper)
         
-        # Clean the mask slightly for a better view
-        mask = cv2.erode(mask, None, iterations=1)
-        mask = cv2.dilate(mask, None, iterations=1)
-
-        # Create a side-by-side view (Original and Mask)
-        # Convert mask to BGR so we can stack it with the colored frame
+        # Side-by-side display
         mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        stacked = np.hstack((frame, mask_bgr))
+        display = np.hstack((frame, mask_bgr))
 
-        # Add text overlay
-        cv2.putText(stacked, f"Tuning: {cfg['name']} (Press 1-4 to switch)", 
-                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        # Text Overlay
+        info = f"MIN: {hsv_vals[0:3]}  MAX: {hsv_vals[3:6]}"
+        cv2.putText(display, info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(display, f"Camera: {cam_idx}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
         
-        cv2.imshow("Calibration (Left: Normal | Right: Mask)", stacked)
+        cv2.imshow("Mac Calibration (Left: Real | Right: Mask)", display)
 
         key = cv2.waitKey(30) & 0xFF
-        if key == ord('q'):
-            break
-        elif key in [ord('1'), ord('2'), ord('3'), ord('4')]:
-            current_choice = chr(key)
-            set_drone_led(current_choice)
-            print(f"Switched to {CONFIGS[current_choice]['name']}")
-        elif key == ord('c'):
-            # Switch camera index
-            new_idx = 2 if cap.get(cv2.CAP_PROP_POS_FRAMES) == 1 else 1
+
+        # --- KEYBOARD LOGIC ---
+        # H-Min (Q/A)
+        if key == ord('q'): hsv_vals[0] = min(179, hsv_vals[0] + 1)
+        if key == ord('a'): hsv_vals[0] = max(0, hsv_vals[0] - 1)
+        # S-Min (W/S)
+        if key == ord('w'): hsv_vals[1] = min(255, hsv_vals[1] + 5)
+        if key == ord('s'): hsv_vals[1] = max(0, hsv_vals[1] - 5)
+        # V-Min (E/D)
+        if key == ord('e'): hsv_vals[2] = min(255, hsv_vals[2] + 5)
+        if key == ord('d'): hsv_vals[2] = max(0, hsv_vals[2] - 5)
+        
+        # H-Max (R/F)
+        if key == ord('r'): hsv_vals[3] = min(179, hsv_vals[3] + 1)
+        if key == ord('f'): hsv_vals[3] = max(0, hsv_vals[3] - 1)
+        # S-Max (T/G)
+        if key == ord('t'): hsv_vals[4] = min(255, hsv_vals[4] + 5)
+        if key == ord('g'): hsv_vals[4] = max(0, hsv_vals[4] - 5)
+        # V-Max (Y/H)
+        if key == ord('y'): hsv_vals[5] = min(255, hsv_vals[5] + 5)
+        if key == ord('h'): hsv_vals[5] = max(0, hsv_vals[5] - 5)
+
+        # Camera Switch (C)
+        if key == ord('c'):
+            cam_idx = 1 if cam_idx == 0 else 0
             cap.release()
-            cap = cv2.VideoCapture(new_idx)
-            print(f"Switched to Camera {new_idx}")
+            cap = cv2.VideoCapture(cam_idx)
+            print(f"Swapped to Camera {cam_idx}")
+
+        # Print (P)
+        if key == ord('p'):
+            print(f"\n--- FINAL VALUES ---")
+            print(f"LOWER = np.array([{hsv_vals[0]}, {hsv_vals[1]}, {hsv_vals[2]}])")
+            print(f"UPPER = np.array([{hsv_vals[3]}, {hsv_vals[4]}, {hsv_vals[5]}])")
+
+        # Quit (ESC)
+        if key == 27:
+            break
 
     cap.release()
     cv2.destroyAllWindows()

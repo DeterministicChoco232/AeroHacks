@@ -5,71 +5,87 @@ from simple_pid import PID
 import drone_rc 
 
 # ==========================================
-# CONFIGURATION
+# 1. YOUR CALIBRATED HSV VALUES
 # ==========================================
-CAM_FRONT_INDEX = 1 # Camera facing the X-Z plane
-CAM_SIDE_INDEX = 2  # Camera facing the Y-Z plane
+# We use a small range for V (200-255) to ensure stability 
+# even if the LED dims slightly during flight. 42, 0, 250, 135, 255, 255
+HSV_LOWER = np.array([42, 0, 250])  
+HSV_UPPER = np.array([135, 255, 255])
 
-# Targets: 0.5 is the middle of the 1m cage
+# ==========================================
+# 2. FLIGHT SETTINGS
+# ==========================================
+CAM_FRONT_INDEX = 0 # Tracks X and Z
+CAM_SIDE_INDEX = 1  # Tracks Y and Z
+
 TARGET_X = 0.5 
 TARGET_Y = 0.5
 TARGET_Z = 0.5 
-
-# Green LED HSV values
-LOWER_GREEN = np.array([35, 50, 50])  
-UPPER_GREEN = np.array([90, 255, 255])
 
 class DroneController:
     def __init__(self):
         self.is_running = True
         
         # --- PID TUNING ---
-        # Pitch/Roll PID: Units are small in Mode 2
-        self.pid_x = PID(18.0, 4.0, 2.0, setpoint=TARGET_X)   # ROLL fixes X
-        self.pid_y = PID(18.0, 4.0, 2.0, setpoint=TARGET_Y)   # PITCH fixes Y
-        self.pid_z = PID(60.0, 10.0, 15.0, setpoint=TARGET_Z) # THRUST fixes Z
+        # No wind = Lower gains for maximum smoothness
+        self.pid_x = PID(12.0, 0.5, 1.0, setpoint=TARGET_X) # Roll
+        self.pid_y = PID(12.0, 0.5, 1.0, setpoint=TARGET_Y) # Pitch
+        self.pid_z = PID(40.0, 2.0, 5.0, setpoint=TARGET_Z) # Thrust
 
-        self.pid_x.output_limits = (-15, 15) 
-        self.pid_y.output_limits = (-15, 15)
-        self.pid_z.output_limits = (-60, 60) 
+        self.pid_x.output_limits = (-12, 12) 
+        self.pid_y.output_limits = (-12, 12)
+        self.pid_z.output_limits = (-50, 50) 
 
-        self.base_thrust = 145 # STARTING POINT - Tune this first!
+        # STARTING THRUST: Adjust this until drone stays at 0.5m
+        self.base_thrust = 3000 
 
-    def get_drone_coords(self, frame):
-        """Returns (horizontal, vertical) normalized 0-1"""
+    def get_drone_center(self, frame):
+        """Finds all bright LEDs and returns their averaged center"""
         if frame is None: return None, None
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN)
         
-        # Noise filter
-        mask = cv2.erode(mask, None, iterations=2)
-        mask = cv2.dilate(mask, None, iterations=2)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, HSV_LOWER, HSV_UPPER)
+        
+        # Clean mask
+        mask = cv2.erode(mask, None, iterations=1)
+        mask = cv2.dilate(mask, None, iterations=1)
         
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        points = []
         if contours:
-            c = max(contours, key=cv2.contourArea)
-            M = cv2.moments(c)
-            if M["m00"] > 0:
-                # Horizontal (X or Y), Vertical (Z)
-                return M["m10"]/M["m00"] / frame.shape[1], M["m01"]/M["m00"] / frame.shape[0]
+            # We take all blobs that look like LEDs (not just the largest)
+            # This allows the "averaging" of Green and White LEDs
+            for c in contours:
+                if cv2.contourArea(c) > 5: # Ignore tiny speckles
+                    M = cv2.moments(c)
+                    if M["m00"] > 0:
+                        points.append((M["m10"]/M["m00"], M["m01"]/M["m00"]))
+
+        if len(points) > 0:
+            avg_x = sum(p[0] for p in points) / len(points)
+            avg_z = sum(p[1] for p in points) / len(points)
+            
+            # Visual feedback for judges
+            cv2.circle(frame, (int(avg_x), int(avg_z)), 15, (0, 255, 0), 2)
+            return avg_x / frame.shape[1], avg_z / frame.shape[0]
+        
         return None, None
 
 def main():
     ctrl = DroneController()
     
     # Init Hardware
-    try:
-        drone_rc.set_mode(2)
-        drone_rc.green_LED(1)
-        drone_rc.red_LED(0)
-        drone_rc.blue_LED(0)
-    except:
-        print("Warning: Could not connect to drone. Check Wi-Fi!")
+    print("Initializing Drone...")
+    drone_rc.set_mode(2)
+    drone_rc.green_LED(1)
+    drone_rc.red_LED(1) # We use both for better averaging
+    time.sleep(1)
 
     cap_f = cv2.VideoCapture(CAM_FRONT_INDEX)
     cap_s = cv2.VideoCapture(CAM_SIDE_INDEX)
 
-    print("System Running. Press SPACE to Emergency Stop.")
+    print("READY. Press SPACE to Emergency Stop.")
 
     try:
         while ctrl.is_running:
@@ -77,45 +93,38 @@ def main():
             ret_s, frame_s = cap_s.read()
 
             # --- SENSE ---
-            # Front camera gives us X and Height
-            curr_x, z_from_front = ctrl.get_drone_coords(frame_f)
-            # Side camera gives us Y and Height
-            curr_y, z_from_side = ctrl.get_drone_coords(frame_s)
+            x, z_f = ctrl.get_drone_center(frame_f)
+            y, z_s = ctrl.get_drone_center(frame_s)
 
-            # --- THINK ---
-            if curr_x is not None and curr_y is not None:
-                # Use the average of both cameras for height stability
-                avg_z_pixel = (z_from_front + z_from_side) / 2
-                curr_z = 1.0 - avg_z_pixel # Invert because 0 is top of screen
+            # --- THINK & ACT ---
+            if x is not None and y is not None:
+                # Average height and invert (0 is top in OpenCV)
+                avg_z = 1.0 - ((z_f + z_s) / 2)
                 
-                # Calculate PID responses
-                target_roll = ctrl.pid_x(curr_x)
-                target_pitch = ctrl.pid_y(curr_y)
-                thrust_adj = ctrl.pid_z(curr_z)
+                # PID Calculations
+                roll = ctrl.pid_x(x)
+                pitch = ctrl.pid_y(y)
+                thrust_adj = ctrl.pid_z(avg_z)
                 
                 final_thrust = int(ctrl.base_thrust + thrust_adj)
                 final_thrust = max(0, min(250, final_thrust))
 
-                # --- ACT ---
-                drone_rc.set_roll(target_roll)
-                drone_rc.set_pitch(target_pitch)
+                # Command Drone
+                drone_rc.set_roll(roll)
+                drone_rc.set_pitch(pitch)
                 drone_rc.manual_thrusts(final_thrust, final_thrust, final_thrust, final_thrust)
                 
-                # Visual Debugging (Draw on the frames)
-                cv2.circle(frame_f, (int(curr_x*frame_f.shape[1]), int(z_from_front*frame_f.shape[0])), 10, (0,255,0), 2)
-                cv2.circle(frame_s, (int(curr_y*frame_s.shape[1]), int(z_from_side*frame_s.shape[0])), 10, (0,255,0), 2)
-                
-                print(f"X:{curr_x:.2f} Y:{curr_y:.2f} Z:{curr_z:.2f} | Thrust:{final_thrust}", end='\r')
+                print(f"X:{x:.2f} Y:{y:.2f} Z:{avg_z:.2f} | T:{final_thrust}", end='\r')
             else:
-                # If LED is missing in either camera, stay level
+                # Level safety
                 drone_rc.set_roll(0)
                 drone_rc.set_pitch(0)
                 drone_rc.manual_thrusts(ctrl.base_thrust, ctrl.base_thrust, ctrl.base_thrust, ctrl.base_thrust)
-                print("LED LOST IN ONE OR BOTH CAMERAS          ", end='\r')
+                print("!!! SEARCHING FOR LEDs !!!          ", end='\r')
 
             # --- DISPLAY ---
-            if frame_f is not None: cv2.imshow('Front (X-Z Axis)', frame_f)
-            if frame_s is not None: cv2.imshow('Side (Y-Z Axis)', frame_s)
+            if frame_f is not None: cv2.imshow('Front View', frame_f)
+            if frame_s is not None: cv2.imshow('Side View', frame_s)
             
             if cv2.waitKey(20) & 0xFF == ord(' '): 
                 drone_rc.emergency_stop()
